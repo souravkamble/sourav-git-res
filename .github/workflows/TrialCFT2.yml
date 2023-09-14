@@ -1,0 +1,142 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template to create AWS resources
+
+Parameters:
+
+  NumberOfWorkers:
+    Type: Number
+    Description: Number of workers for the Glue job
+  MaxRetries:
+    Type: Number
+    Description: MaxRetries for the Glue job
+  Timeout:
+    Type: Number
+    Description: Timeout for the Glue job
+
+Resources:
+  Yelpinbucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: 'datalake-rawzone-g3'
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt WorkflowLambda.Arn
+
+  Yelpoutbucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: 'yelp-output-data-g3'
+
+  DatabaseYelp:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseInput:
+        Name: 'yelpdatabase'
+        Description: 'AWS Glue database creation'
+
+  WorkflowYelp:
+    Type: AWS::Glue::Workflow
+    Properties:
+      Description: 'Create workflow'
+      MaxConcurrentRuns: 1
+      Name: 'yelpworkflow'
+
+  WorkflowJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Role: arn:aws:iam::742240590358:role/LabRole
+      Command:
+        Name: 'glueetl'
+        ScriptLocation: 's3://bdata-script/script.py'  # Change the path
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      ExecutionClass: FLEX
+      Name: 'yelp-data-cleaning'
+      GlueVersion: '4.0'
+      WorkerType: 'G.1X'
+      MaxRetries: !Ref MaxRetries
+      NumberOfWorkers: !Ref NumberOfWorkers
+      Timeout: !Ref Timeout
+      
+
+  CrawlerYelp:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: 'Yelpcrawler'
+      Role: 'LabRole'
+      Description: 'AWS Glue crawler to crawl Yelp data'
+      DatabaseName: !Ref DatabaseYelp
+      Targets:
+        S3Targets:
+          - Path: 's3://yelp-output-data-g3/'  # Change the path
+      TablePrefix: 'Cleanyelpdata'
+      SchemaChangePolicy:
+        UpdateBehavior: 'UPDATE_IN_DATABASE'
+        DeleteBehavior: 'LOG'
+      Configuration: '{"Version":1.0}'
+
+  WorkflowLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+          def lambda_handler(event, context):
+              glue = boto3.client('glue')
+              response = glue.start_workflow_run(Name='yelpworkflow')
+              print(response)
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Starting the yelpworkflow')
+              }
+
+      Handler: index.lambda_handler
+      Role: 'arn:aws:iam::742240590358:role/LabRole'  # Different for everyone, change the ARN
+      Runtime: python3.8
+      FunctionName: 'LambdaforWorkflow'
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: WorkflowLambda
+    Properties:
+      FunctionName: !GetAtt WorkflowLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: 's3.amazonaws.com'  
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: 'arn:aws:s3:::datalake-rawzone-g3' 
+
+  WorkflowStartTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: 'StartTrigger'
+      Type: ON_DEMAND
+      Description: 'Trigger to start the workflow'
+      Actions:
+        - JobName: !Ref WorkflowJob
+      WorkflowName: !Ref WorkflowYelp
+
+  YelpCrawlerTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: 'JobSuccessfulTrigger'
+      Type: CONDITIONAL
+      StartOnCreation: TRUE
+      Description: 'Trigger to start the Yelp data crawler'
+      Actions:
+        - CrawlerName: !Ref CrawlerYelp
+      Predicate:
+        Conditions:
+          - LogicalOperator: EQUALS
+            JobName: !Ref WorkflowJob
+            State: SUCCEEDED
+      WorkflowName: !Ref WorkflowYelp
+
+Outputs:
+  WorkflowLambdaArn:
+    Description: 'ARN of the AWS Lambda function for the workflow'
+    Value: !GetAtt WorkflowLambda.Arn
+
